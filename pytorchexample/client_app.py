@@ -107,8 +107,8 @@ def train(msg: Message, context: Context) -> Message:
 
         # Strategy A: Random Gaussian Noise Attack
         # for key in state_dict:
-             # noise = torch.randn_like(state_dict[key]) * 1.0
-             # state_dict[key] = initial_params[key] + noise
+            # noise = torch.randn_like(state_dict[key]) * 1.0
+            # state_dict[key] = initial_params[key] + noise
 
         # Strategy B: Extreme Scaling / Gradient Bombing Attack
         for key in state_dict:

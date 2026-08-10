@@ -80,7 +80,7 @@ class ReputationFedAvg(FedAvg):
             if node_id not in self.reputation_scores:
                 self.reputation_scores[node_id] = 1.0
 
-        MAX_UPDATE_NORM = 15.0
+        MAX_UPDATE_NORM = 3.0
 
         clipped_client_updates = []
         for update in client_updates:
@@ -191,7 +191,7 @@ class ReputationFedAvg(FedAvg):
                 f"Reputation: {old_score:.3f} -> {self.reputation_scores[node_id]:.3f}"
             )
 
-        # Weighted Aggregation
+        # Updated Weighted Aggregation
         weighted_weights = []
         total_reputation_weight = 0.0
 
@@ -205,13 +205,15 @@ class ReputationFedAvg(FedAvg):
         ):
             rep = self.reputation_scores[node_id]
 
-            if idx not in clean_indices:
+            # HARD EXCLUSION RULE:
+            # 1. If it failed the Multi-Krum anomaly detection (not in clean_indices)
+            # 2. OR its accumulated reputation has fallen below the threshold
+            if idx not in clean_indices or rep < self.min_reputation_threshold:
+                print(
+                    f"[Round {server_round}] DROPPED Node {node_id} (Status: {'Clean-Failed' if idx not in clean_indices else 'Low Rep'}, Rep: {rep:.2f})")
                 continue
 
-            if rep < self.min_reputation_threshold:
-                print(f"[Round {server_round}] Ignored Node {node_id} (Low Rep {rep:.2f})")
-                continue
-
+            # If it passes, it gets factored into the aggregation using its reputation as a weight modifier
             effective_weight = n_samples * rep
             weighted_weights.append((weights, effective_weight))
             total_reputation_weight += effective_weight

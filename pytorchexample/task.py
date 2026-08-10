@@ -25,7 +25,7 @@ class Net(nn.Module):
 def train(net, trainloader, epochs, lr, device):
     """Train the network on the training set."""
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     net.train()
 
     epoch_loss = 0.0
