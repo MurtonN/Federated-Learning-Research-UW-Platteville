@@ -18,7 +18,7 @@ from pytorchexample.task import train as train_fn
 data_files = "Wednesday_workingHours_cleaned.csv"
 
 # Read only headers and determine columns to save memory
-sample_df = pd.read_csv(data_files, nrows=5)
+sample_df = pd.read_csv(data_files, nrows=10)
 sample_df.columns = sample_df.columns.str.strip()
 target_column = "Label"  # Change to your target column name
 
@@ -105,10 +105,10 @@ def train(msg: Message, context: Context) -> Message:
 
         # Choose one of the following attack strategies:
 
-        # Strategy A: Random Gaussian Noise Attack (Destroys model stability)
+        # Strategy A: Random Gaussian Noise Attack
         # for key in state_dict:
-        #     noise = torch.randn_like(state_dict[key]) * 10.0
-        #     state_dict[key] = initial_params[key] + noise
+             # noise = torch.randn_like(state_dict[key]) * 1.0
+             # state_dict[key] = initial_params[key] + noise
 
         # Strategy B: Extreme Scaling / Gradient Bombing Attack
         for key in state_dict:

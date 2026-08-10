@@ -11,7 +11,7 @@ class ReputationFedAvg(FedAvg):
     def __init__(
             self,
             decay_factor: float = 0.8,
-            min_reputation_threshold: float = 0.2,
+            min_reputation_threshold: float = 0.6,
             arrayrecord_key: str = "arrays",
             **kwargs,
     ):
@@ -19,6 +19,7 @@ class ReputationFedAvg(FedAvg):
         self.decay_factor = decay_factor
         self.min_reputation_threshold = min_reputation_threshold
         self.reputation_scores: Dict[str, float] = {}
+        self.client_history: Dict[str, List[np.ndarray]] = {}  # Tracks past updates for historical consistency
         self.arrayrecord_key = arrayrecord_key
         self.current_global_weights: Optional[List[np.ndarray]] = None
 
@@ -48,9 +49,7 @@ class ReputationFedAvg(FedAvg):
         if not valid_replies:
             return None, None
 
-        # -------------------------------------------------------------
-        # SORT REPLIES BY NODE ID
-        # -------------------------------------------------------------
+        # Sort replies by node ID for determinism
         valid_replies = sorted(
             valid_replies,
             key=lambda r: str(r.metadata.src_node_id)
@@ -81,34 +80,81 @@ class ReputationFedAvg(FedAvg):
             if node_id not in self.reputation_scores:
                 self.reputation_scores[node_id] = 1.0
 
-        num_clients = len(node_ids)
-        flat_updates = np.array([
-            np.concatenate([p.ravel() for p in update]) for update in client_updates
-        ])
+        MAX_UPDATE_NORM = 15.0
 
-        # --- DYNAMIC ATTACKER DETECTION (OUTLIER ESTIMATION) ---
+        clipped_client_updates = []
+        for update in client_updates:
+            flat_update = np.concatenate([p.ravel() for p in update])
+            norm = np.linalg.norm(flat_update)
+            if norm > MAX_UPDATE_NORM:
+                scale_factor = MAX_UPDATE_NORM / (norm + 1e-8)
+                update = [p * scale_factor for p in update]
+            clipped_client_updates.append(update)
+
+        # Flatten the CLIPPED updates for distance and historical tracking
+        flat_updates = np.array([
+            np.concatenate([p.ravel() for p in update]) for update in clipped_client_updates
+        ])
+        # Determine number of active clients replying this round
+        num_clients = len(valid_replies)
+
+        # -------------------------------------------------------------
+        # 1. DIRECTIONAL & DISTANCE METRICS (Euclidean + Cosine Similarity)
+        # -------------------------------------------------------------
         distances = np.zeros((num_clients, num_clients))
+        cosine_similarities = np.zeros((num_clients, num_clients))
+
         for i in range(num_clients):
             for j in range(i + 1, num_clients):
+                # Euclidean distance
                 dist = np.linalg.norm(flat_updates[i] - flat_updates[j])
                 distances[i, j] = dist
                 distances[j, i] = dist
 
-        # Compute average distance from each client to all other clients
-        mean_distances = np.mean(distances, axis=1)
+                # Cosine similarity to catch low-magnitude direction flips ("Little is Enough")
+                dot_prod = np.dot(flat_updates[i], flat_updates[j])
+                norm_i = np.linalg.norm(flat_updates[i])
+                norm_j = np.linalg.norm(flat_updates[j])
+                sim = dot_prod / (norm_i * norm_j + 1e-8)
+                cosine_similarities[i, j] = sim
+                cosine_similarities[j, i] = sim
 
-        # Automatically detect outliers using Median Absolute Deviation (MAD)
+        # -------------------------------------------------------------
+        # 2. HISTORICAL CONSISTENCY TRACKING (Sleeper Node Detection)
+        # -------------------------------------------------------------
+        historical_penalties = np.zeros(num_clients)
+        for i, node_id in enumerate(node_ids):
+            if node_id in self.client_history and len(self.client_history[node_id]) > 0:
+                # Compare current update direction with its past average direction
+                past_avg = np.mean(self.client_history[node_id], axis=0)
+                dot_prod = np.dot(flat_updates[i], past_avg)
+                self_sim = dot_prod / (np.linalg.norm(flat_updates[i]) * np.linalg.norm(past_avg) + 1e-8)
+
+                # If a traditionally stable node suddenly points in an opposite direction, penalize heavily
+                if self_sim < -0.2:
+                    historical_penalties[i] = 5.0  # Artificial inflation of anomaly distance
+
+            # Update history queue (keep last 3 rounds)
+            if node_id not in self.client_history:
+                self.client_history[node_id] = []
+            self.client_history[node_id].append(flat_updates[i])
+            if len(self.client_history[node_id]) > 3:
+                self.client_history[node_id].pop(0)
+
+        # -------------------------------------------------------------
+        # 3. ADAPTIVE THRESHOLDING FOR LATE-STAGE CONVERGENCE
+        # -------------------------------------------------------------
+        mean_distances = np.mean(distances, axis=1) + historical_penalties
         median_dist = np.median(mean_distances)
         mad = np.median(np.abs(mean_distances - median_dist))
 
-        # Dynamic threshold for anomaly detection
-        threshold = median_dist + 2.5 * (mad if mad > 0 else np.std(mean_distances))
+        # Dynamically tighten the threshold multiplier as rounds progress (convergence tightening)
+        adaptive_multiplier = max(1.5, 3.0 - (0.05 * server_round))
+        threshold = median_dist + adaptive_multiplier * (mad if mad > 0 else np.std(mean_distances))
 
-        # Dynamically estimate number of malicious nodes based on anomaly score
         detected_malicious = [i for i, d in enumerate(mean_distances) if d > threshold]
         estimated_num_malicious = min(max(0, len(detected_malicious)), num_clients - 2)
 
-        # Safeguards for k and m_top calculation
         m_top = max(1, num_clients - estimated_num_malicious)
         k = max(1, m_top - 2)
 
@@ -119,24 +165,20 @@ class ReputationFedAvg(FedAvg):
             score = np.sum(sorted_dists[1: effective_k + 1])
             krum_scores.append(score)
 
-        # -------------------------------------------------------------
-        # DETERMINISTIC TIE-BREAKING
-        # Sort by (score, node_id) so identical scores break ties predictably
-        # -------------------------------------------------------------
+        # Deterministic tie-breaking
         scored_clients = sorted(
             enumerate(krum_scores),
             key=lambda item: (item[1], node_ids[item[0]])
         )
         clean_indices = set(idx for idx, _ in scored_clients[:m_top])
 
-        # Print logs in sorted order
+        # Logging reputation updates
         quality_scores = {}
-        print(f"\n--- Round {server_round} Dynamic Krum Filtering (Est. Malicious: {estimated_num_malicious}) ---")
+        print(f"\n--- Round {server_round} Advanced Trust Framework (Est. Malicious: {estimated_num_malicious}) ---")
         for idx, node_id in enumerate(node_ids):
             is_clean = idx in clean_indices
             quality_scores[node_id] = 1.0 if is_clean else 0.0
 
-            # EMA Reputation update
             old_score = self.reputation_scores[node_id]
             q_score = quality_scores[node_id]
             self.reputation_scores[node_id] = (
@@ -149,7 +191,7 @@ class ReputationFedAvg(FedAvg):
                 f"Reputation: {old_score:.3f} -> {self.reputation_scores[node_id]:.3f}"
             )
 
-        # --- WEIGHTED AGGREGATION ---
+        # Weighted Aggregation
         weighted_weights = []
         total_reputation_weight = 0.0
 
@@ -166,7 +208,7 @@ class ReputationFedAvg(FedAvg):
             if idx not in clean_indices:
                 continue
 
-            if rep < self.min_reputation_threshold: # ignores the node if quality is low enough
+            if rep < self.min_reputation_threshold:
                 print(f"[Round {server_round}] Ignored Node {node_id} (Low Rep {rep:.2f})")
                 continue
 
@@ -178,7 +220,6 @@ class ReputationFedAvg(FedAvg):
             print(f"[Round {server_round}] Warning: All client updates were rejected!")
             return None, None
 
-        # Layer-wise Aggregation
         num_layers = len(raw_weights_list[0])
         aggregated_ndarrays = []
 
